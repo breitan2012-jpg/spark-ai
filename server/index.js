@@ -10,11 +10,13 @@ import QRCode from 'qrcode'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const dataDir = process.env.BREITAN_DATA_DIR || join(root, 'local-data')
+const imagesDir = join(dataDir, 'images')
 const authFile = join(dataDir, 'auth.json')
 const vaultFile = join(dataDir, 'vault.json')
 const telemetryFile = join(dataDir, 'telemetry.json')
 const backupDir = join(dataDir, 'backups')
 mkdirSync(dataDir, { recursive: true })
+mkdirSync(imagesDir, { recursive: true })
 mkdirSync(backupDir, { recursive: true })
 const app = express()
 app.use(express.json({ limit: '250mb' }))
@@ -105,7 +107,18 @@ app.post('/api/convert', requireAuth, async (req, res) => {
   try {
     const { data, format, width, height, quality } = req.body || {}
     if (!data || !['png', 'jpeg', 'webp', 'avif', 'tiff', 'gif'].includes(format)) return res.status(400).json({ error: 'Imagen o formato inválido.' })
-    const source = Buffer.from(data.split(',').at(-1), 'base64')
+    let source
+    if (data.startsWith('/api/images/')) {
+      const imageId = data.split('/api/images/')[1]
+      const state = load(req)
+      const image = state.images.find(x => x.id === imageId)
+      if (!image || !image.path) return res.status(404).json({ error: 'Imagen no encontrada' })
+      const filePath = join(imagesDir, image.path)
+      if (!existsSync(filePath)) return res.status(404).json({ error: 'Archivo no encontrado en disco' })
+      source = readFileSync(filePath)
+    } else {
+      source = Buffer.from(data.split(',').at(-1), 'base64')
+    }
     if (source.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'Límite de 25 MB por imagen.' })
     let pipeline = sharp(source, { limitInputPixels: 100_000_000 }).rotate()
     if (width || height) pipeline = pipeline.resize(width ? Number(width) : undefined, height ? Number(height) : undefined, { fit: 'inside', withoutEnlargement: true })
@@ -113,6 +126,48 @@ app.post('/api/convert', requireAuth, async (req, res) => {
     res.setHeader('Content-Type', `image/${format === 'jpeg' ? 'jpeg' : format === 'tiff' ? 'tiff' : format}`)
     res.send(output)
   } catch (error) { res.status(400).json({ error: `No se pudo convertir: ${error.message}` }) }
+})
+
+// Servir imágenes desde disco
+app.get('/api/images/:id', requireAuth, async (req, res) => {
+  try {
+    const state = load(req)
+    const image = state.images.find(x => x.id === req.params.id)
+    if (!image || !image.path) return res.status(404).json({ error: 'Imagen no encontrada' })
+    const filePath = join(imagesDir, image.path)
+    if (!existsSync(filePath)) return res.status(404).json({ error: 'Archivo no encontrado en disco' })
+    res.sendFile(filePath)
+  } catch (error) { res.status(500).json({ error: error.message }) }
+})
+
+// Subir imagen y guardarla en disco
+app.post('/api/images', requireAuth, async (req, res) => {
+  try {
+    const { name, data, size, mime } = req.body || {}
+    if (!data || !name) return res.status(400).json({ error: 'Faltan datos de la imagen' })
+    const buffer = Buffer.from(data.split(',').at(-1), 'base64')
+    if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'Límite de 25 MB por imagen.' })
+    const ext = (mime && mime.split('/')[1]) || name.split('.').pop() || 'png'
+    const fileName = `${randomBytes(16).toString('hex')}.${ext}`
+    const filePath = join(imagesDir, fileName)
+    writeFileSync(filePath, buffer)
+    const record = { id: randomBytes(8).toString('hex'), name, size: buffer.length, mime: mime || `image/${ext}`, path: fileName, createdAt: new Date().toISOString() }
+    res.json(record)
+  } catch (error) { res.status(500).json({ error: error.message }) }
+})
+
+// Eliminar imagen del disco
+app.delete('/api/images/:id', requireAuth, async (req, res) => {
+  try {
+    const state = load(req)
+    const image = state.images.find(x => x.id === req.params.id)
+    if (!image || !image.path) return res.status(404).json({ error: 'Imagen no encontrada' })
+    const filePath = join(imagesDir, image.path)
+    if (existsSync(filePath)) unlinkSync(filePath)
+    state.images = state.images.filter(x => x.id !== req.params.id)
+    save(req, state)
+    res.json({ ok: true })
+  } catch (error) { res.status(500).json({ error: error.message }) }
 })
 
 function sshMetrics(server) {
@@ -137,7 +192,7 @@ function sshMetrics(server) {
           } catch (e) { done(e) }
         })
       })
-    }).on('error', done).connect({ host: server.host, port: Number(server.port) || 22, username: server.username, password: server.password || undefined, privateKey: server.privateKey || undefined, readyTimeout: 8000 })
+    }).on('error', done).connect({ host: server.host, port: Number(server.port) || 22, username: server.username, password: server.password || undefined, privateKey: server.privateKey || undefined, readyTimeout: 15000 })
   })
 }
 function sshExec(server, command) {
@@ -149,7 +204,7 @@ function sshExec(server, command) {
       let output = '', errors = ''
       stream.on('data', chunk => output += chunk).stderr.on('data', chunk => errors += chunk)
       stream.on('close', code => code === 0 ? done(null, output) : done(new Error(errors.trim() || `SSH: código ${code}`)))
-    })).on('error', done).connect({ host: server.host, port: Number(server.port) || 22, username: server.username, password: server.password || undefined, privateKey: server.privateKey || undefined, readyTimeout: 8000 })
+    })).on('error', done).connect({ host: server.host, port: Number(server.port) || 22, username: server.username, password: server.password || undefined, privateKey: server.privateKey || undefined, readyTimeout: 15000 })
   })
 }
 const serverFrom = (req, type) => {
@@ -224,7 +279,7 @@ async function getMetrics(server) {
 }
 async function collectMetrics(key) {
   const state = decrypt(readJSON(vaultFile), key)
-  const result = await Promise.all(state.servers.slice(0, 2).map(async server => {
+  const result = await Promise.all(state.servers.slice(0, 10).map(async server => {
     try { return { id: server.id, name: server.name, online: true, ...(await getMetrics(server)) } }
     catch (error) { return { id: server.id, name: server.name, online: false, error: error.message } }
   }))
@@ -271,10 +326,10 @@ const stageAction = (req, name, args, label) => { const proposalId = id(); pendi
 function aiAction(state, args) {
   const { operation, resource, item, id: itemId } = args
   if (!resources.includes(resource)) throw new Error('Módulo inválido')
-  if (operation === 'list') return resource === 'images' ? state.images.map(({ data, ...rest }) => rest) : state[resource]
+  if (operation === 'list') return resource === 'images' ? state.images.map(({ path, ...rest }) => rest) : state[resource]
   if (operation === 'create') {
     if (resource === 'images') throw new Error('Usa generate_qr o convert_image para crear imágenes')
-    if (resource === 'servers' && state.servers.length >= 2) throw new Error('Máximo dos servidores')
+    if (resource === 'servers' && state.servers.length >= 10) throw new Error('Máximo diez servidores')
     const record = { ...item, id: id(), createdAt: new Date().toISOString() }; state[resource].unshift(record); addActivity(state, `IA agregó ${resource}: ${record.title || record.name || record.ssid || 'registro'}`, resource); return record
   }
   const index = state[resource].findIndex(x => x.id === itemId)
@@ -338,17 +393,24 @@ app.post('/api/ai/apply', requireAuth, async (req, res) => {
       save(req, state)
     } else if (proposal.name === 'convert_image') {
       const image = state.images.find(x => x.id === args.image_id)
-      if (!image?.data || !['png','jpeg','webp','avif','tiff','gif'].includes(args.format)) throw new Error('Imagen o formato inválido')
-      const output = await sharp(Buffer.from(image.data.split(',').at(-1), 'base64')).rotate().toFormat(args.format).toBuffer()
+      if (!image?.path || !['png','jpeg','webp','avif','tiff','gif'].includes(args.format)) throw new Error('Imagen o formato inválido')
+      const filePath = join(imagesDir, image.path)
+      if (!existsSync(filePath)) throw new Error('Archivo no encontrado en disco')
+      const output = await sharp(readFileSync(filePath)).rotate().toFormat(args.format).toBuffer()
       if (output.length > 20 * 1024 * 1024) throw new Error('Imagen convertida demasiado grande')
-      const record = { id: id(), name: `${image.name.replace(/\.[^.]+$/, '')}.${args.format}`, data: `data:image/${args.format};base64,${output.toString('base64')}`, size: output.length, mime: `image/${args.format}`, createdAt: new Date().toISOString() }
+      const ext = args.format
+      const fileName = `${randomBytes(16).toString('hex')}.${ext}`
+      writeFileSync(join(imagesDir, fileName), output)
+      const record = { id: id(), name: `${image.name.replace(/\.[^.]+$/, '')}.${args.format}`, size: output.length, mime: `image/${ext}`, path: fileName, createdAt: new Date().toISOString() }
       state.images.unshift(record); addActivity(state, `IA convirtió imagen: ${record.name}`, 'images'); save(req, state)
       inverse = { kind: 'delete', resource: 'images', id: record.id }; result = { id: record.id, name: record.name }
     } else if (proposal.name === 'generate_qr') {
       const url = new URL(args.url)
       if (!['http:', 'https:'].includes(url.protocol)) throw new Error('URL inválida')
-      const data = await QRCode.toDataURL(url.toString(), { width: 700, margin: 3, errorCorrectionLevel: 'H', color: { dark: '#111b32', light: '#ffffff' } })
-      const record = { id: id(), name: `${String(args.title || 'Código QR').slice(0, 60)}.png`, data, size: Buffer.from(data.split(',')[1], 'base64').length, mime: 'image/png', createdAt: new Date().toISOString() }
+      const output = await QRCode.toBuffer(url.toString(), { width: 700, margin: 3, errorCorrectionLevel: 'H', color: { dark: '#111b32', light: '#ffffff' } })
+      const fileName = `${randomBytes(16).toString('hex')}.png`
+      writeFileSync(join(imagesDir, fileName), output)
+      const record = { id: id(), name: `${String(args.title || 'Código QR').slice(0, 60)}.png`, size: output.length, mime: 'image/png', path: fileName, createdAt: new Date().toISOString() }
       state.images.unshift(record); addActivity(state, `IA generó QR: ${record.name}`, 'images'); save(req, state)
       inverse = { kind: 'delete', resource: 'images', id: record.id }; result = { id: record.id, name: record.name }
     } else if (proposal.name === 'control_container') {
